@@ -3,7 +3,7 @@ import shutil
 import exifread
 from tqdm import tqdm
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from tabulate import tabulate
@@ -61,22 +61,14 @@ def find_arw_files(sd_folder):
                     arw_files[(base_name, creation_date)] = arw_path
     return arw_files
 
-# Function to preload all metadata into RAM
-def preload_metadata(sd_card_folders, num_workers):
-    arw_files = {}
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(find_arw_files, folder) for folder in sd_card_folders]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Preloading metadata", unit="folder"):
-            result = future.result()
-            arw_files.update(result)
-    return arw_files
-
 # Function to find files with similar metadata
 def find_similar_files(target_date, arw_files):
     similar_files = []
+    time_threshold = timedelta(seconds=15)
     for (base_name, creation_date), arw_path in arw_files.items():
-        time_difference = abs((creation_date - target_date).total_seconds())
-        similar_files.append((arw_path, creation_date, time_difference))
+        time_difference = abs(creation_date - target_date)
+        if time_difference <= time_threshold:
+            similar_files.append((arw_path, creation_date, time_difference.total_seconds()))
     similar_files.sort(key=lambda x: x[2])  # Sort by time difference
     return similar_files
 
@@ -125,53 +117,38 @@ def process_jpg_file(jpg_file, selected_jpg_folder, arw_files, output_folder, lo
         logging.warning(log_message)
 
         similar_files = find_similar_files(jpg_creation_date, arw_files)
-        unmatched_files.append((jpg_file, jpg_path, jpg_creation_date, similar_files))
-
-def handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file):
-    for jpg_file, jpg_path, jpg_creation_date, similar_files in unmatched_files:
         if similar_files:
-            original_file = {
-                'name': jpg_file,
-                'path': jpg_path,
-                'time': jpg_creation_date
-            }
-            arw_path = get_user_confirmation(original_file, similar_files)
-            if arw_path:
-                output_path = os.path.join(output_folder, os.path.basename(arw_path))
-                try:
-                    shutil.copy2(arw_path, output_path)
-                    logging.info(f"Copied {arw_path} to {output_path} after user confirmation")
-                except Exception as e:
-                    log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
-                    log_file.write(log_message)
-                    logging.error(log_message)
-            else:
-                log_message = f"No valid .arw file found for {jpg_file} after user confirmation\n"
-                log_file.write(log_message)
-                logging.error(log_message)
+            unmatched_files.append((jpg_file, jpg_path, jpg_creation_date, similar_files))
         else:
             log_message = f"No similar .arw files found for {jpg_file}\n"
             print(log_message)
             log_file.write(log_message)
             logging.warning(log_message)
 
-def main():
-    # Ask the user if they want to use the RAM-optimized version
-    use_ram_optimized = get_user_input("Do you want to use the RAM-optimized version? (y/n)", default_value="y").lower() == 'y'
+def handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file):
+    for jpg_file, jpg_path, jpg_creation_date, similar_files in unmatched_files:
+        original_file = {
+            'name': jpg_file,
+            'path': jpg_path,
+            'time': jpg_creation_date
+        }
+        arw_path = get_user_confirmation(original_file, similar_files)
+        if arw_path:
+            output_path = os.path.join(output_folder, os.path.basename(arw_path))
+            try:
+                shutil.copy2(arw_path, output_path)
+                logging.info(f"Copied {arw_path} to {output_path} after user confirmation")
+            except Exception as e:
+                log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
+                log_file.write(log_message)
+                logging.error(log_message)
+        else:
+            log_message = f"No valid .arw file found for {jpg_file} after user confirmation\n"
+            log_file.write(log_message)
+            logging.error(log_message)
 
-    if use_ram_optimized:
-        while True:
-            batch_size = int(get_user_input("Enter the batch size for processing", default_value="50"))
-            num_workers = int(get_user_input("Enter the number of workers to use for parallel processing", default_value="8"))
-            chunk_size = int(get_user_input("Enter the chunk size for reading files (in MB)", default_value="16")) * 1024 * 1024
-            # Calculate estimated RAM usage: assume each file's metadata and contents use chunk_size MB
-            estimated_ram_usage = batch_size * num_workers * (chunk_size / (1024 * 1024))  # Rough estimate in MB
-            print(f"Estimated RAM usage: {estimated_ram_usage:.2f} MB")
-            confirm_params = get_user_input("Do you confirm these parameters? (y/n)", default_value="y").lower()
-            if confirm_params == 'y':
-                break
-    else:
-        num_workers = int(get_user_input("Enter the number of workers to use for parallel processing", default_value="8"))
+def main():
+    num_workers = int(get_user_input("Enter the number of workers to use for parallel processing", default_value="8"))
 
     selected_jpg_folder = os.path.abspath(get_user_input("Enter the path to the folder containing the selected .jpg files"))
     sd_card_folders = [os.path.abspath(path) for path in get_user_input("Enter the paths to the SD card folders (separated by space)").split()]
@@ -185,10 +162,6 @@ def main():
         ["Output folder for .arw files", output_folder],
         ["Number of workers", num_workers]
     ]
-    if use_ram_optimized:
-        summary_table.append(["Batch size", batch_size])
-        summary_table.append(["Chunk size (MB)", chunk_size / (1024 * 1024)])
-        summary_table.append(["Estimated RAM usage", f"{estimated_ram_usage:.2f} MB"])
 
     print(tabulate(summary_table, tablefmt="grid"))
 
@@ -205,7 +178,12 @@ def main():
 
     # Preload metadata for all .arw files using multiple threads
     print("\nPreloading metadata for .arw files...")
-    arw_files = preload_metadata(sd_card_folders, num_workers)
+    arw_files = {}
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(find_arw_files, folder) for folder in sd_card_folders]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Preloading metadata", unit="folder"):
+            result = future.result()
+            arw_files.update(result)
 
     # Get the list of selected .jpg files
     selected_jpg_files = [f for f in os.listdir(selected_jpg_folder) if f.lower().endswith('.jpg')]
@@ -219,22 +197,12 @@ def main():
         log_file.write("Log of missing .arw files:\n\n")
         print("\nCopying corresponding .arw files to the output folder...")
 
-        if use_ram_optimized:
-            # Process files in batches
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                for i in range(0, total_files, batch_size):
-                    batch_files = selected_jpg_files[i:i + batch_size]
-                    futures = [executor.submit(process_jpg_file, jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files)
-                               for jpg_file in batch_files]
-                    for future in tqdm(as_completed(futures), total=len(futures), desc="Copying .arw files", unit="file"):
-                        future.result()
-        else:
-            # Copy corresponding .arw files to the output folder in parallel
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(process_jpg_file, jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files)
-                           for jpg_file in selected_jpg_files]
-                for future in tqdm(as_completed(futures), total=len(futures), desc="Copying .arw files", unit="file"):
-                    future.result()
+        # Process files in batches
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(process_jpg_file, jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files)
+                       for jpg_file in selected_jpg_files]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Copying .arw files", unit="file"):
+                future.result()
 
     # Handle unmatched files after initial processing
     handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file)
