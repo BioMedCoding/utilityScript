@@ -1,14 +1,19 @@
+'''
 import os
 import shutil
 import exifread
 from tqdm import tqdm
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from tabulate import tabulate
 
-# Configurazione del logging
-logging.basicConfig(filename="script.log", level=logging.INFO, format="%(asctime)s:%(levelname)s:%(message)s")
+# Logging configuration
+logging.basicConfig(filename="script.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Funzione per ottenere la data di creazione dai metadati EXIF
+# Function to get the creation date from EXIF metadata
 def get_creation_date(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -17,78 +22,421 @@ def get_creation_date(file_path):
             if date_tag in tags:
                 return datetime.strptime(str(tags[date_tag]), '%Y:%m:%d %H:%M:%S')
     except Exception as e:
-        logging.error(f"Errore nella lettura dei metadati da {file_path}: {e}")
+        logging.error(f"Error reading metadata from {file_path}: {e}")
     return None
 
+# Function to get the base name of a file, ignoring Windows modifications
+def get_base_name(file_name):
+    return re.sub(r'\s\(\d+\)$', '', os.path.splitext(file_name)[0])
+
+# Function to get user input with confirmation
 def get_user_input(prompt):
+    print(".............................................................................")
     value = input(prompt)
-    confirmation = input(f"Hai inserito: '{value}'. Confermi? (s/n): ")
-    while confirmation.lower() != 's':
+    confirmation = input(f"You entered: '{value}'. Confirm? (y/n): ")
+    while confirmation.lower() != 'y':
         value = input(prompt)
-        confirmation = input(f"Hai inserito: '{value}'. Confermi? (s/n): ")
+        confirmation = input(f"You entered: '{value}'. Confirm? (y/n): ")
     return value
 
-def main():
-    selected_jpg_folder = get_user_input("Inserisci il percorso della cartella contenente i file .jpg selezionati: ")
-    sd_card_folders = get_user_input("Inserisci i percorsi delle cartelle delle schede SD (separati da uno spazio): ").split()
-    output_folder = get_user_input("Inserisci il percorso della cartella di output per i file .arw: ")
-
-    print("\nRiepilogo delle scelte:")
-    print(f"Cartella contenente i file .jpg selezionati: {selected_jpg_folder}")
-    print(f"Cartelle delle schede SD: {', '.join(sd_card_folders)}")
-    print(f"Cartella di output per i file .arw: {output_folder}")
-
-    final_confirmation = input("Confermi queste scelte? (s/n): ")
-    if final_confirmation.lower() != 's':
-        print("Operazione annullata.")
-        return
-
-    # Crea la cartella di output se non esiste
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    # Ottieni la lista dei file jpg selezionati
-    selected_jpg_files = [f for f in os.listdir(selected_jpg_folder) if f.lower().endswith('.jpg')]
-
-    # Dizionario per memorizzare i file .arw trovati
+# Function to find .arw files in SD card folders
+def find_arw_files(sd_folder):
     arw_files = {}
+    for root, _, files in os.walk(sd_folder):
+        for file in files:
+            if file.lower().endswith('.arw'):
+                arw_path = os.path.join(root, file)
+                creation_date = get_creation_date(arw_path)
+                if creation_date:
+                    base_name = get_base_name(file)
+                    arw_files[(base_name, creation_date)] = arw_path
+    return arw_files
 
-    # Cerca i file .arw nelle cartelle delle schede SD
-    for sd_folder in sd_card_folders:
-        for root, _, files in os.walk(sd_folder):
-            for file in files:
-                if file.lower().endswith('.arw'):
-                    arw_path = os.path.join(root, file)
-                    creation_date = get_creation_date(arw_path)
-                    if creation_date:
-                        arw_files[creation_date] = arw_path
+# Function to find files with similar metadata
+def find_similar_files(target_date, arw_files):
+    similar_files = []
+    for (base_name, creation_date), arw_path in arw_files.items():
+        time_difference = abs((creation_date - target_date).total_seconds())
+        similar_files.append((arw_path, creation_date, time_difference))
+    similar_files.sort(key=lambda x: x[2])  # Sort by time difference
+    return similar_files
 
-    # Crea un file di log per i file .arw non trovati
-    log_file_path = os.path.join(output_folder, "log.txt")
-    with open(log_file_path, "w") as log_file:
-        # Copia i file .arw corrispondenti nella cartella di output
-        for jpg_file in tqdm(selected_jpg_files, desc="Cercando file .arw corrispondenti"):
-            jpg_path = os.path.join(selected_jpg_folder, jpg_file)
-            jpg_creation_date = get_creation_date(jpg_path)
-            
-            if jpg_creation_date and jpg_creation_date in arw_files:
-                arw_path = arw_files[jpg_creation_date]
+def get_user_confirmation(original_file, similar_files):
+    print(f"\nOriginal file: {original_file['name']}, Path: {original_file['path']}, Shooting time: {original_file['time']}\n")
+    print("Multiple similar files found:")
+
+    table_data = [
+        [idx + 1, os.path.basename(sim_path), sim_path, sim_date, f"{time_diff:.2f} seconds"]
+        for idx, (sim_path, sim_date, time_diff) in enumerate(similar_files)
+    ]
+    print(tabulate(table_data, headers=["Option", "Name", "Path", "Shooting Time", "Time Difference"]))
+
+    choice = input("\nEnter the number of the correct file (or '0' to enter manually): ")
+    if choice.isdigit() and 1 <= int(choice) <= len(similar_files):
+        return similar_files[int(choice) - 1][0]
+    elif choice == '0':
+        manual_file = input("Enter the full path to the correct file: ")
+        if os.path.exists(manual_file):
+            return manual_file
+        else:
+            print("File does not exist. Please try again.")
+            return get_user_confirmation(original_file, similar_files)
+    else:
+        print("Invalid choice. Please try again.")
+        return get_user_confirmation(original_file, similar_files)
+
+def process_jpg_file(jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files):
+    jpg_path = os.path.join(selected_jpg_folder, jpg_file)
+    jpg_creation_date = get_creation_date(jpg_path)
+    base_name = get_base_name(jpg_file)
+
+    if (base_name, jpg_creation_date) in arw_files:
+        arw_path = arw_files[(base_name, jpg_creation_date)]
+        output_path = os.path.join(output_folder, os.path.basename(arw_path))
+        try:
+            shutil.copy2(arw_path, output_path)
+            logging.info(f"Copied {arw_path} to {output_path}")
+        except Exception as e:
+            log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
+            log_file.write(log_message)
+            logging.error(log_message)
+    else:
+        log_message = f".arw file not found for {jpg_file} with creation date {jpg_creation_date}\n"
+        log_file.write(log_message)
+        logging.warning(log_message)
+
+        similar_files = find_similar_files(jpg_creation_date, arw_files)
+        unmatched_files.append((jpg_file, jpg_path, jpg_creation_date, similar_files))
+
+def handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file):
+    for jpg_file, jpg_path, jpg_creation_date, similar_files in unmatched_files:
+        if similar_files:
+            original_file = {
+                'name': jpg_file,
+                'path': jpg_path,
+                'time': jpg_creation_date
+            }
+            arw_path = get_user_confirmation(original_file, similar_files)
+            if arw_path:
                 output_path = os.path.join(output_folder, os.path.basename(arw_path))
                 try:
                     shutil.copy2(arw_path, output_path)
-                    logging.info(f"Copiato {arw_path} in {output_path}")
+                    logging.info(f"Copied {arw_path} to {output_path} after user confirmation")
                 except Exception as e:
-                    log_message = f"Errore nella copia di {arw_path} in {output_path}: {e}\n"
-                    print(log_message)
+                    log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
                     log_file.write(log_message)
                     logging.error(log_message)
             else:
-                log_message = f"File .arw non trovato per {jpg_file}\n"
-                print(log_message)
+                log_message = f"No valid .arw file found for {jpg_file} after user confirmation\n"
                 log_file.write(log_message)
-                logging.warning(log_message)
+                logging.error(log_message)
+        else:
+            log_message = f"No similar .arw files found for {jpg_file}\n"
+            print(log_message)
+            log_file.write(log_message)
+            logging.warning(log_message)
 
-    print("Script completato. Controlla il file di log per eventuali problemi.")
+def main():
+    selected_jpg_folder = os.path.abspath(get_user_input("Enter the path to the folder containing the selected .jpg files: "))
+    sd_card_folders = [os.path.abspath(path) for path in get_user_input("Enter the paths to the SD card folders (separated by space): ").split()]
+    output_folder = os.path.abspath(get_user_input("Enter the path to the output folder for .arw files: "))
+    num_workers = int(get_user_input("Enter the number of workers to use for parallel processing: "))
+
+    print("\nSummary of choices:")
+    sd_folders_summary = "\n".join([f"{i + 1}. {folder}" for i, folder in enumerate(sd_card_folders)])
+    summary_table = [
+        ["Folder containing selected .jpg files", selected_jpg_folder],
+        ["SD card folders", sd_folders_summary],
+        ["Output folder for .arw files", output_folder],
+        ["Number of workers", num_workers]
+    ]
+    print(tabulate(summary_table, tablefmt="grid"))
+
+    final_confirmation = input("\nDo you confirm these choices? (y/n): ")
+    if final_confirmation.lower() != 'y':
+        print("Operation cancelled.")
+        return
+
+    start_time = time.time()
+
+    # Create output folder if it does not exist
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Dictionary to store found .arw files
+    arw_files = {}
+
+    # Search for .arw files in the SD card folders in parallel
+    print("\nScanning SD card folders for .arw files...")
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(find_arw_files, sd_folder) for sd_folder in sd_card_folders]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Analyzing SD card folders", unit="folder"):
+            result = future.result()
+            arw_files.update(result)
+
+    # Get the list of selected .jpg files
+    selected_jpg_files = [f for f in os.listdir(selected_jpg_folder) if f.lower().endswith('.jpg')]
+    total_files = len(selected_jpg_files)
+
+    unmatched_files = []
+
+    # Create a log file for .arw files not found
+    log_file_path = os.path.join(output_folder, "log.txt")
+    with open(log_file_path, "w") as log_file:
+        log_file.write("Log of missing .arw files:\n\n")
+        print("\nCopying corresponding .arw files to the output folder...")
+
+        # Copy corresponding .arw files to the output folder in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(process_jpg_file, jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files)
+                       for jpg_file in selected_jpg_files]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Copying .arw files", unit="file"):
+                future.result()
+
+    # Handle unmatched files after initial processing
+    handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file)
+
+    total_elapsed_time = time.time() - start_time
+    completion_message = f"Script completed in {total_elapsed_time:.2f} seconds. Check the log file for any issues."
+    print(completion_message)
+    logging.info(completion_message)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+import os
+import shutil
+import exifread
+from tqdm import tqdm
+import logging
+from datetime import datetime, timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from tabulate import tabulate
+from functools import lru_cache
+
+# Logging configuration
+logging.basicConfig(filename="script.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# LRU Cache for EXIF data to minimize disk reads
+@lru_cache(maxsize=None)
+def get_creation_date(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            tags = exifread.process_file(f)
+            date_tag = 'EXIF DateTimeOriginal'
+            if date_tag in tags:
+                return datetime.strptime(str(tags[date_tag]), '%Y:%m:%d %H:%M:%S')
+    except Exception as e:
+        logging.error(f"Error reading metadata from {file_path}: {e}")
+    return None
+
+# Function to get the base name of a file, ignoring Windows modifications
+def get_base_name(file_name):
+    return re.sub(r'\s\(\d+\)$', '', os.path.splitext(file_name)[0])
+
+# Function to get user input with confirmation
+def get_user_input(prompt):
+    print(".............................................................................")
+    value = input(prompt)
+    confirmation = input(f"You entered: '{value}'. Confirm? (y/n): ")
+    while confirmation.lower() != 'y':
+        value = input(prompt)
+        confirmation = input(f"You entered: '{value}'. Confirm? (y/n): ")
+    return value
+
+# Function to find .arw files in SD card folders
+def find_arw_files(sd_folder):
+    arw_files = {}
+    for root, _, files in os.walk(sd_folder):
+        for file in files:
+            if file.lower().endswith('.arw'):
+                arw_path = os.path.join(root, file)
+                creation_date = get_creation_date(arw_path)
+                if creation_date:
+                    base_name = get_base_name(file)
+                    arw_files[(base_name, creation_date)] = arw_path
+    return arw_files
+
+# Function to find files with similar metadata
+def find_similar_files(target_date, arw_files):
+    similar_files = []
+    for (base_name, creation_date), arw_path in arw_files.items():
+        time_difference = abs((creation_date - target_date).total_seconds())
+        similar_files.append((arw_path, creation_date, time_difference))
+    similar_files.sort(key=lambda x: x[2])  # Sort by time difference
+    return similar_files
+
+def get_user_confirmation(original_file, similar_files):
+    print(f"\nOriginal file: {original_file['name']}, Path: {original_file['path']}, Shooting time: {original_file['time']}\n")
+    print("Multiple similar files found:")
+
+    table_data = [
+        [idx + 1, os.path.basename(sim_path), sim_path, sim_date, f"{time_diff:.2f} seconds"]
+        for idx, (sim_path, sim_date, time_diff) in enumerate(similar_files)
+    ]
+    print(tabulate(table_data, headers=["Option", "Name", "Path", "Shooting Time", "Time Difference"]))
+
+    choice = input("\nEnter the number of the correct file (or '0' to enter manually): ")
+    if choice.isdigit() and 1 <= int(choice) <= len(similar_files):
+        return similar_files[int(choice) - 1][0]
+    elif choice == '0':
+        manual_file = input("Enter the full path to the correct file: ")
+        if os.path.exists(manual_file):
+            return manual_file
+        else:
+            print("File does not exist. Please try again.")
+            return get_user_confirmation(original_file, similar_files)
+    else:
+        print("Invalid choice. Please try again.")
+        return get_user_confirmation(original_file, similar_files)
+
+def process_jpg_file(jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files):
+    jpg_path = os.path.join(selected_jpg_folder, jpg_file)
+    jpg_creation_date = get_creation_date(jpg_path)
+    base_name = get_base_name(jpg_file)
+
+    if (base_name, jpg_creation_date) in arw_files:
+        arw_path = arw_files[(base_name, jpg_creation_date)]
+        output_path = os.path.join(output_folder, os.path.basename(arw_path))
+        try:
+            shutil.copy2(arw_path, output_path)
+            logging.info(f"Copied {arw_path} to {output_path}")
+        except Exception as e:
+            log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
+            log_file.write(log_message)
+            logging.error(log_message)
+    else:
+        log_message = f".arw file not found for {jpg_file} with creation date {jpg_creation_date}\n"
+        log_file.write(log_message)
+        logging.warning(log_message)
+
+        similar_files = find_similar_files(jpg_creation_date, arw_files)
+        unmatched_files.append((jpg_file, jpg_path, jpg_creation_date, similar_files))
+
+def handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file):
+    for jpg_file, jpg_path, jpg_creation_date, similar_files in unmatched_files:
+        if similar_files:
+            original_file = {
+                'name': jpg_file,
+                'path': jpg_path,
+                'time': jpg_creation_date
+            }
+            arw_path = get_user_confirmation(original_file, similar_files)
+            if arw_path:
+                output_path = os.path.join(output_folder, os.path.basename(arw_path))
+                try:
+                    shutil.copy2(arw_path, output_path)
+                    logging.info(f"Copied {arw_path} to {output_path} after user confirmation")
+                except Exception as e:
+                    log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
+                    log_file.write(log_message)
+                    logging.error(log_message)
+            else:
+                log_message = f"No valid .arw file found for {jpg_file} after user confirmation\n"
+                log_file.write(log_message)
+                logging.error(log_message)
+        else:
+            log_message = f"No similar .arw files found for {jpg_file}\n"
+            print(log_message)
+            log_file.write(log_message)
+            logging.warning(log_message)
+
+def main():
+    # Ask the user if they want to use the RAM-optimized version
+    use_ram_optimized = get_user_input("Do you want to use the RAM-optimized version? (y/n): ").lower() == 'y'
+
+    if use_ram_optimized:
+        while True:
+            batch_size = int(get_user_input("Enter the batch size for processing: "))
+            num_workers = int(get_user_input("Enter the number of workers to use for parallel processing: "))
+            estimated_ram_usage = batch_size * num_workers * 1.5  # Rough estimate in MB
+            print(f"Estimated RAM usage: {estimated_ram_usage:.2f} MB")
+            confirm_params = get_user_input("Do you confirm these parameters? (y/n): ").lower()
+            if confirm_params == 'y':
+                break
+    else:
+        num_workers = int(get_user_input("Enter the number of workers to use for parallel processing: "))
+
+    selected_jpg_folder = os.path.abspath(get_user_input("Enter the path to the folder containing the selected .jpg files: "))
+    sd_card_folders = [os.path.abspath(path) for path in get_user_input("Enter the paths to the SD card folders (separated by space): ").split()]
+    output_folder = os.path.abspath(get_user_input("Enter the path to the output folder for .arw files: "))
+
+    print("\nSummary of choices:")
+    sd_folders_summary = "\n".join([f"{i + 1}. {folder}" for i, folder in enumerate(sd_card_folders)])
+    summary_table = [
+        ["Folder containing selected .jpg files", selected_jpg_folder],
+        ["SD card folders", sd_folders_summary],
+        ["Output folder for .arw files", output_folder],
+        ["Number of workers", num_workers]
+    ]
+    if use_ram_optimized:
+        summary_table.append(["Batch size", batch_size])
+        summary_table.append(["Estimated RAM usage", f"{estimated_ram_usage:.2f} MB"])
+
+    print(tabulate(summary_table, tablefmt="grid"))
+
+    final_confirmation = input("\nDo you confirm these choices? (y/n): ")
+    if final_confirmation.lower() != 'y':
+        print("Operation cancelled.")
+        return
+
+    start_time = time.time()
+
+    # Create output folder if it does not exist
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Dictionary to store found .arw files
+    arw_files = {}
+
+    # Search for .arw files in the SD card folders in parallel
+    print("\nScanning SD card folders for .arw files...")
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(find_arw_files, sd_folder) for sd_folder in sd_card_folders]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Analyzing SD card folders", unit="folder"):
+            result = future.result()
+            arw_files.update(result)
+
+    # Get the list of selected .jpg files
+    selected_jpg_files = [f for f in os.listdir(selected_jpg_folder) if f.lower().endswith('.jpg')]
+    total_files = len(selected_jpg_files)
+
+    unmatched_files = []
+
+    # Create a log file for .arw files not found
+    log_file_path = os.path.join(output_folder, "log.txt")
+    with open(log_file_path, "w") as log_file:
+        log_file.write("Log of missing .arw files:\n\n")
+        print("\nCopying corresponding .arw files to the output folder...")
+
+        if use_ram_optimized:
+            # Process files in batches
+            for i in range(0, total_files, batch_size):
+                batch_files = selected_jpg_files[i:i + batch_size]
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = [executor.submit(process_jpg_file, jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files)
+                               for jpg_file in batch_files]
+                    for future in tqdm(as_completed(futures), total=len(futures), desc="Copying .arw files", unit="file"):
+                        future.result()
+        else:
+            # Copy corresponding .arw files to the output folder in parallel
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(process_jpg_file, jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files)
+                           for jpg_file in selected_jpg_files]
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Copying .arw files", unit="file"):
+                    future.result()
+
+    # Handle unmatched files after initial processing
+    handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file)
+
+    total_elapsed_time = time.time() - start_time
+    completion_message = f"Script completed in {total_elapsed_time:.2f} seconds. Check the log file for any issues."
+    print(completion_message)
+    logging.info(completion_message)
 
 if __name__ == "__main__":
     main()
