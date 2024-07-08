@@ -26,7 +26,7 @@ def get_creation_date(file_path):
         logging.error(f"Error reading metadata from {file_path}: {e}")
     return None
 
-# Function to get the base name of a file, ignoring Windows modifications
+# Function to get the progressive number of the photo
 def get_base_name(file_name):
     match = re.match(r'_DSC(\d{4})', file_name)
     if match:
@@ -52,6 +52,7 @@ def get_user_input(prompt, default_value=None):
     return value
 
 # Function to find .arw files in SD card folders
+# CHECK IT AGAIN
 def find_arw_files(sd_folder):
     arw_files = {}
     for root, _, files in os.walk(sd_folder):
@@ -60,16 +61,16 @@ def find_arw_files(sd_folder):
                 arw_path = os.path.join(root, file)
                 creation_date = get_creation_date(arw_path)
                 base_name = get_base_name(file)
-                if creation_date and base_name:
+                if creation_date and base_name: # Check that both are note None
                     if base_name not in arw_files:
-                        arw_files[base_name] = []
+                        arw_files[base_name] = []   # Initialize a new key
                     arw_files[base_name].append((arw_path, creation_date))
     return arw_files
 
 # Function to find files with similar metadata
-def find_similar_files(target_date, arw_file_list):
+def find_similar_files(target_date, arw_file_list,max_time_difference):
     similar_files = []
-    time_threshold = timedelta(seconds=15)
+    time_threshold = timedelta(seconds=max_time_difference)
     for arw_path, creation_date in arw_file_list:
         time_difference = abs(creation_date - target_date)
         if time_difference <= time_threshold:
@@ -155,11 +156,11 @@ def handle_unmatched_files(unmatched_files, output_folder, log_file):
             logging.error(log_message)
 
 def main():
-    num_workers = int(get_user_input("Enter the number of workers to use for parallel processing", default_value="8"))
+    num_workers = int(get_user_input("\nEnter the number of workers to use for parallel processing", default_value="8"))
 
-    selected_jpg_folder = os.path.abspath(get_user_input("Enter the path to the folder containing the selected .jpg files"))
-    sd_card_folders = [os.path.abspath(path) for path in get_user_input("Enter the paths to the SD card folders (separated by space)").split()]
-    output_folder = os.path.abspath(get_user_input("Enter the path to the output folder for .arw files"))
+    selected_jpg_folder = os.path.abspath(get_user_input("\nEnter the path to the folder containing the selected .jpg files"))
+    sd_card_folders = [os.path.abspath(path) for path in get_user_input("\nEnter the paths to the SD card folders (separated by space)").split()]
+    output_folder = os.path.abspath(get_user_input("\nEnter the path to the output folder for .arw files"))
 
     print("\nSummary of choices:")
     sd_folders_summary = "\n".join([f"{i + 1}. {folder}" for i, folder in enumerate(sd_card_folders)])
@@ -207,20 +208,20 @@ def main():
         log_file.write("Log of missing .arw files:\n\n")
         print("\nCopying corresponding .arw files to the output folder...")
 
-        # Process files in batches
+        # Process files using the pool of workers
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(process_jpg_file, jpg_file, selected_jpg_folder, arw_files, output_folder, log_file, unmatched_files)
                        for jpg_file in selected_jpg_files]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Copying .arw files", unit="file"):
                 future.result()
 
-    # Handle unmatched files after initial processing
-    handle_unmatched_files(unmatched_files, output_folder, log_file)
-
     total_elapsed_time = time.time() - start_time
-    completion_message = f"Script completed in {total_elapsed_time:.2f} seconds. Check the log file for any issues."
+    completion_message = f"Automatic part completed in {total_elapsed_time:.2f} seconds. Check the log file for any issues. Eventual exceptions will now be processed"
     print(completion_message)
     logging.info(completion_message)
+
+    # Handle unmatched files after initial processing
+    handle_unmatched_files(unmatched_files, output_folder, log_file)
 
 if __name__ == "__main__":
     main()
