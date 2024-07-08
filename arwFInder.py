@@ -28,7 +28,10 @@ def get_creation_date(file_path):
 
 # Function to get the base name of a file, ignoring Windows modifications
 def get_base_name(file_name):
-    return re.sub(r'\s\(\d+\)$', '', os.path.splitext(file_name)[0])
+    match = re.match(r'_DSC(\d{4})', file_name)
+    if match:
+        return match.group(1)
+    return None
 
 # Function to get user input with confirmation
 def get_user_input(prompt, default_value=None):
@@ -56,16 +59,18 @@ def find_arw_files(sd_folder):
             if file.lower().endswith('.arw'):
                 arw_path = os.path.join(root, file)
                 creation_date = get_creation_date(arw_path)
-                if creation_date:
-                    base_name = get_base_name(file)
-                    arw_files[(base_name, creation_date)] = arw_path
+                base_name = get_base_name(file)
+                if creation_date and base_name:
+                    if base_name not in arw_files:
+                        arw_files[base_name] = []
+                    arw_files[base_name].append((arw_path, creation_date))
     return arw_files
 
 # Function to find files with similar metadata
-def find_similar_files(target_date, arw_files):
+def find_similar_files(target_date, arw_file_list):
     similar_files = []
     time_threshold = timedelta(seconds=15)
-    for (base_name, creation_date), arw_path in arw_files.items():
+    for arw_path, creation_date in arw_file_list:
         time_difference = abs(creation_date - target_date)
         if time_difference <= time_threshold:
             similar_files.append((arw_path, creation_date, time_difference.total_seconds()))
@@ -101,31 +106,33 @@ def process_jpg_file(jpg_file, selected_jpg_folder, arw_files, output_folder, lo
     jpg_creation_date = get_creation_date(jpg_path)
     base_name = get_base_name(jpg_file)
 
-    if (base_name, jpg_creation_date) in arw_files:
-        arw_path = arw_files[(base_name, jpg_creation_date)]
-        output_path = os.path.join(output_folder, os.path.basename(arw_path))
-        try:
-            shutil.copy2(arw_path, output_path)
-            logging.info(f"Copied {arw_path} to {output_path}")
-        except Exception as e:
-            log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
-            log_file.write(log_message)
-            logging.error(log_message)
+    if base_name in arw_files:
+        arw_file_list = arw_files[base_name]
+        if len(arw_file_list) == 1:
+            arw_path = arw_file_list[0][0]
+            output_path = os.path.join(output_folder, os.path.basename(arw_path))
+            try:
+                shutil.copy2(arw_path, output_path)
+                logging.info(f"Copied {arw_path} to {output_path}")
+            except Exception as e:
+                log_message = f"Error copying {arw_path} to {output_path}: {e}\n"
+                log_file.write(log_message)
+                logging.error(log_message)
+        else:
+            similar_files = find_similar_files(jpg_creation_date, arw_file_list)
+            if similar_files:
+                unmatched_files.append((jpg_file, jpg_path, jpg_creation_date, similar_files))
+            else:
+                log_message = f"No similar .arw files found for {jpg_file}\n"
+                print(log_message)
+                log_file.write(log_message)
+                logging.warning(log_message)
     else:
         log_message = f".arw file not found for {jpg_file} with creation date {jpg_creation_date}\n"
         log_file.write(log_message)
         logging.warning(log_message)
 
-        similar_files = find_similar_files(jpg_creation_date, arw_files)
-        if similar_files:
-            unmatched_files.append((jpg_file, jpg_path, jpg_creation_date, similar_files))
-        else:
-            log_message = f"No similar .arw files found for {jpg_file}\n"
-            print(log_message)
-            log_file.write(log_message)
-            logging.warning(log_message)
-
-def handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file):
+def handle_unmatched_files(unmatched_files, output_folder, log_file):
     for jpg_file, jpg_path, jpg_creation_date, similar_files in unmatched_files:
         original_file = {
             'name': jpg_file,
@@ -183,7 +190,10 @@ def main():
         futures = [executor.submit(find_arw_files, folder) for folder in sd_card_folders]
         for future in tqdm(as_completed(futures), total=len(futures), desc="Preloading metadata", unit="folder"):
             result = future.result()
-            arw_files.update(result)
+            for key, value in result.items():
+                if key not in arw_files:
+                    arw_files[key] = []
+                arw_files[key].extend(value)
 
     # Get the list of selected .jpg files
     selected_jpg_files = [f for f in os.listdir(selected_jpg_folder) if f.lower().endswith('.jpg')]
@@ -205,7 +215,7 @@ def main():
                 future.result()
 
     # Handle unmatched files after initial processing
-    handle_unmatched_files(unmatched_files, arw_files, output_folder, log_file)
+    handle_unmatched_files(unmatched_files, output_folder, log_file)
 
     total_elapsed_time = time.time() - start_time
     completion_message = f"Script completed in {total_elapsed_time:.2f} seconds. Check the log file for any issues."
